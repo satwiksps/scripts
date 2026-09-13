@@ -1,0 +1,1 @@
+- Fixed repeated SDK container image downloads when Docker image stores report different image IDs, and verified downloaded archives before caching them ([Flatcar#2086](https://github.com/flatcar/Flatcar/issues/2086)).

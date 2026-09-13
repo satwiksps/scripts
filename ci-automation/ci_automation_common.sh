@@ -176,8 +176,13 @@ function docker_image_fullname() {
     local image="$1"
     local version="$2"
 
-    $docker images --no-trunc --format '{{.Repository}}:{{.Tag}}' \
-        | grep -E "^(${CONTAINER_REGISTRY}/)*${image}:${version}$"
+    if image_exists_locally "${CONTAINER_REGISTRY}/${image}" "${version}"; then
+        echo "${CONTAINER_REGISTRY}/${image}:${version}"
+    elif image_exists_locally "${image}" "${version}"; then
+        echo "${image}:${version}"
+    else
+        return 1
+    fi
 }
 # --
 
@@ -216,61 +221,87 @@ function docker_commit_to_buildcache() {
 }
 # --
 
-function docker_image_from_buildcache() {
+function docker_image_from_buildcache() (
+    set -o pipefail
+
     local name="$1"
     local version="$2"
     local compr="${3:-zst}"
     local tgz="${name}-${version}.tar.${compr}"
-    local id_file="${name}-${version}.id"
-    local id_file_url="https://${BUILDCACHE_SERVER}/containers/${version}/${id_file}"
-    local id_file_url_release="https://mirror.release.flatcar-linux.net/containers/${version}/${id_file}"
+    local cache_dir="__build__/container-images"
+    local stamp_file="${cache_dir}/${tgz}.local"
+    local short_image="${name}:${version}"
+    local full_image="${CONTAINER_REGISTRY}/${short_image}"
+    local tmp_dir lock_fd
 
-    local local_image=""
-    if image_exists_locally "${name}" "${version}" ; then
-        local_image="${name}:${version}"
-    elif image_exists_locally "${CONTAINER_REGISTRY}/${name}" "${version}" ; then
-        local_image="${CONTAINER_REGISTRY}/${name}:${version}"
-    fi
+    mkdir -p "${cache_dir}" || return 1
+    exec {lock_fd}>"${cache_dir}/${name}-${version}.lock" || return 1
+    flock "${lock_fd}" || return 1
+    tmp_dir=$(mktemp -d "${cache_dir}/download.XXXXXXXX") || return 1
+    trap 'rm -f "${tmp_dir}/${tgz}" "${tmp_dir}/stamp"; rmdir "${tmp_dir}"' EXIT
 
-    if [[ -n "${local_image}" ]] ; then
-        local image_id=""
-        image_id=$($docker image inspect "${local_image}" | jq -r '.[].Id' | sed 's/^sha256://')
-        local remote_id=""
-        remote_id=$(curl --fail --silent --show-error --location --retry-delay 1 \
-                    --retry 60 --retry-connrefused --retry-max-time 60 --connect-timeout 20 \
-                    "${id_file_url}" \
-                    || curl --fail --silent --show-error --location --retry-delay 1 \
-                    --retry 60 --retry-connrefused --retry-max-time 60 --connect-timeout 20 \
-                    "${id_file_url_release}" \
-                    || echo "not found")
-        if [ "${image_id}" = "${remote_id}" ]; then
-          echo "Local image is up-to-date" >&2
-          return
-        fi
-        echo "Local image outdated, downloading..." >&2
-    fi
-
-    # First try bincache then release to allow a bincache overwrite
-    local url="https://${BUILDCACHE_SERVER}/containers/${version}/${tgz}"
-    local url_release="https://mirror.release.flatcar-linux.net/containers/${version}/${tgz}"
-
+    local curl_options=(--fail --location --retry-delay 1 --retry 60
+        --retry-connrefused --retry-max-time 60 --connect-timeout 20)
     local curl_progress=(--silent --show-error)
     if [[ -t 2 ]]; then
         curl_progress=(--progress-bar)
     fi
 
-    curl --fail "${curl_progress[@]}" --location --retry-delay 1 --retry 60 \
-        --retry-connrefused --retry-max-time 60 --connect-timeout 20 \
-        --remote-name "${url}" \
-        || curl --fail "${curl_progress[@]}" --location --retry-delay 1 --retry 60 \
-        --retry-connrefused --retry-max-time 60 --connect-timeout 20 \
-        --remote-name "${url_release}"
+    local url metadata digest cached_digest cached_id extra image image_id
+    for url in "https://${BUILDCACHE_SERVER}" "https://mirror.release.flatcar-linux.net"; do
+        url+="/containers/${version}/${tgz}"
+        metadata=$(curl "${curl_options[@]}" --silent --show-error "${url}.DIGESTS") || continue
+        digest=$(awk -v file="${tgz}" 'length($1) == 128 && $1 !~ /[^0-9a-f]/ && $2 == file { print $1 }' <<<"${metadata}")
+        if [[ ! ${digest} =~ ^[0-9a-f]{128}$ ]]; then
+            echo "Invalid SHA512 digest in ${url}.DIGESTS" >&2
+            return 1
+        fi
 
-    # zstd can handle zlib as well :)
-    zstd -d -c ${tgz} | $docker load
+        cached_digest='' cached_id='' extra=''
+        if [[ -f ${stamp_file} ]]; then
+            read -r cached_digest cached_id extra <"${stamp_file}" || true
+        fi
+        if [[ ${cached_digest} = "${digest}" && -n ${cached_id} && -z ${extra} ]]; then
+            for image in "${short_image}" "${full_image}"; do
+                image_id=$($docker image inspect --format '{{.Id}}' "${image}") || break
+                [[ ${image_id} = "${cached_id}" ]] || break
+                if [[ ${image} = "${full_image}" ]]; then
+                    echo "Local image is up-to-date" >&2
+                    return 0
+                fi
+            done
+        fi
 
-    rm "${tgz}"
-}
+        rm -f "${stamp_file}" || return 1
+        # Keep the archive and its digest on the same mirror.
+        curl "${curl_options[@]}" "${curl_progress[@]}" \
+            --output "${tmp_dir}/${tgz}" "${url}" || continue
+        if ! printf '%s *%s\n' "${digest}" "${tmp_dir}/${tgz}" | sha512sum --check --status; then
+            echo "SHA512 verification failed for ${url}" >&2
+            return 1
+        fi
+
+        image=$(zstd -d -c "${tmp_dir}/${tgz}" | tar -xOf - manifest.json | \
+            jq -er --arg short "${short_image}" --arg full "${full_image}" \
+                '[.[].RepoTags[]? | select(. == $short or . == $full or . == ("localhost/" + $short))] | unique |
+                 if length == 1 then .[0] else error("expected one matching image tag") end') || return 1
+        if ! zstd -d -c "${tmp_dir}/${tgz}" | $docker load; then
+            echo "Failed to load ${tgz}" >&2
+            return 1
+        fi
+        image_id=$($docker image inspect --format '{{.Id}}' "${image}") || return 1
+        [[ ${image_id} =~ ^(sha256:)?[0-9a-f]{64}$ ]] || return 1
+
+        # SDK and package callers use different forms of the image name.
+        $docker tag "${image_id}" "${short_image}" || return 1
+        $docker tag "${image_id}" "${full_image}" || return 1
+        printf '%s %s\n' "${digest}" "${image_id}" >"${tmp_dir}/stamp" || return 1
+        mv "${tmp_dir}/stamp" "${stamp_file}" || return 1
+        return 0
+    done
+
+    return 2
+)
 # --
 
 function docker_image_from_registry_or_buildcache() {
@@ -282,8 +313,17 @@ function docker_image_from_registry_or_buildcache() {
     fi
 
     echo "Container image not found in registry, downloading SDK tarball instead (this is normal for nightly builds)..." >&2
-    docker_image_from_buildcache "${image}" "${version}" zst || \
+    local status
+    if docker_image_from_buildcache "${image}" "${version}" zst; then
+        return 0
+    else
+        status=$?
+    fi
+    if [[ ${status} -eq 2 ]]; then
         docker_image_from_buildcache "${image}" "${version}" gz
+    else
+        return "${status}"
+    fi
 }
 # --
 
