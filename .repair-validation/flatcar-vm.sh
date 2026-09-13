@@ -199,7 +199,7 @@ timeout 30s "${cri[@]}" info > "$logs/cri-info.json"
 timeout 180s "${cri[@]}" pull "$image"
 "${cri[@]}" inspecti "$image" > "$logs/cri-image.json"
 mkdir -p /var/log/pr4150-cri
-printf '%s\n' '{"metadata":{"name":"pr4150","namespace":"validation","uid":"pr4150","attempt":0},"log_directory":"/var/log/pr4150-cri","linux":{"security_context":{"namespace_options":{"network":2}}}}' > /run/pr4150-pod.json
+printf '%s\n' '{"metadata":{"name":"pr4150","namespace":"validation","uid":"pr4150","attempt":0},"log_directory":"/var/log/pr4150-cri","linux":{"cgroup_parent":"system.slice","security_context":{"namespace_options":{"network":2}}}}' > /run/pr4150-pod.json
 printf '%s\n' '{"metadata":{"name":"smoke","attempt":0},"image":{"image":"docker.io/library/busybox:1.37.0"},"command":["/bin/sh","-c","echo pr4150-cri-ok"],"log_path":"container.log","linux":{}}' > /run/pr4150-container.json
 pod=
 container=
