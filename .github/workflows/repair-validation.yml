@@ -1,0 +1,69 @@
+name: Flatcar PR repair validation
+on:
+  push:
+    branches: [validation/flatcar-pr-repairs-20260913]
+permissions:
+  contents: read
+jobs:
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y zstd jq busybox-static podman
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1
+        with:
+          context: classic
+          runtime-basedir: ${{ runner.temp }}/docker-classic
+          daemon-config: '{"features":{"containerd-snapshotter":false}}'
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1
+        with:
+          context: containerd
+          runtime-basedir: ${{ runner.temp }}/docker-containerd
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - name: SDK regression tests
+        run: bash test-container-download.sh
+      - name: Docker storage backend integration
+        run: bash .repair-validation/sdk-live.sh "$PWD" "$RUNNER_TEMP/sdk-live"
+      - name: Podman archive compatibility
+        run: bash .repair-validation/sdk-podman.sh "$PWD" "$RUNNER_TEMP/sdk-podman"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sdk-runtime-evidence
+          path: |
+            ${{ runner.temp }}/sdk-live/*-*.txt
+            ${{ runner.temp }}/sdk-live/results.txt
+            ${{ runner.temp }}/sdk-live/*/requests.txt
+            ${{ runner.temp }}/sdk-podman/*.txt
+  containerd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils openssh-client curl bzip2 python3
+      - name: Download containerd 2.3.4
+        run: |
+          mkdir -p "$RUNNER_TEMP/containerd-bin"
+          cd "$RUNNER_TEMP/containerd-bin"
+          curl -fL --retry 3 -o containerd.tar.gz https://github.com/containerd/containerd/releases/download/v2.3.4/containerd-2.3.4-linux-amd64.tar.gz
+          echo '9d68969855fbf676cdb8ed758e420fb048d61f984f61de3e53eddfebe484d168  containerd.tar.gz' | sha256sum -c -
+          tar -xzf containerd.tar.gz
+      - name: Linux configuration checks
+        run: python3 .repair-validation/containerd-probes.py "$PWD" "$RUNNER_TEMP/containerd-bin/bin/containerd" "$RUNNER_TEMP/containerd-probes"
+      - name: Flatcar VM service checks
+        run: bash .repair-validation/flatcar-vm.sh "$PWD" "$RUNNER_TEMP/flatcar-vm"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: containerd-runtime-evidence
+          path: |
+            ${{ runner.temp }}/containerd-probes
+            ${{ runner.temp }}/flatcar-vm/*.txt
+            ${{ runner.temp }}/flatcar-vm/*.log
+            ${{ runner.temp }}/flatcar-vm/*.json
+            ${{ runner.temp }}/flatcar-vm/guest-logs.tar.gz
