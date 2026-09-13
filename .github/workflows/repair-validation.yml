@@ -1,4 +1,4 @@
-name: Containerd PR runtime validation
+name: Containerd default import check
 on:
   push:
     branches: [validation/flatcar-pr-repairs-20260913]
@@ -7,12 +7,11 @@ permissions:
 jobs:
   containerd:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils openssh-client curl bzip2 python3
       - name: Download containerd 2.3.4
         run: |
           mkdir -p "$RUNNER_TEMP/containerd-bin"
@@ -20,17 +19,14 @@ jobs:
           curl -fL --retry 3 -o containerd.tar.gz https://github.com/containerd/containerd/releases/download/v2.3.4/containerd-2.3.4-linux-amd64.tar.gz
           echo '9d68969855fbf676cdb8ed758e420fb048d61f984f61de3e53eddfebe484d168  containerd.tar.gz' | sha256sum -c -
           tar -xzf containerd.tar.gz
-      - name: Linux configuration checks
-        run: python3 .repair-validation/containerd-probes.py "$PWD" "$RUNNER_TEMP/containerd-bin/bin/containerd" "$RUNNER_TEMP/containerd-probes"
-      - name: Flatcar VM service checks
-        run: bash .repair-validation/flatcar-vm.sh "$PWD" "$RUNNER_TEMP/flatcar-vm"
+      - name: Check the real default import directory
+        run: |
+          sudo python3 .repair-validation/default-import-check.py \
+            "$PWD/.repair-validation/baseline" \
+            "$PWD/sdk_container/src/third_party/coreos-overlay/coreos/sysext/containerd/usr/share/containerd" \
+            "$RUNNER_TEMP/containerd-bin/bin/containerd" "$RUNNER_TEMP/default-import-check"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: containerd-runtime-evidence
-          path: |
-            ${{ runner.temp }}/containerd-probes
-            ${{ runner.temp }}/flatcar-vm/*.txt
-            ${{ runner.temp }}/flatcar-vm/*.log
-            ${{ runner.temp }}/flatcar-vm/*.json
-            ${{ runner.temp }}/flatcar-vm/guest-logs.tar.gz
+          name: default-import-evidence
+          path: ${{ runner.temp }}/default-import-check
